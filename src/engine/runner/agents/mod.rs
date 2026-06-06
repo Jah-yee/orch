@@ -1065,6 +1065,24 @@ pub(crate) mod patterns {
     use super::AgentError;
     use std::time::Duration;
 
+    /// Returns true if the pattern found at `pos` (byte offset in `text`) is at a word
+    /// boundary — i.e., surrounded by non-identifier chars. Used to suppress false
+    /// positives from identifiers like `record_rate_limit_returns_id`.
+    fn is_word_boundary(text: &str, pos: usize, pattern: &str) -> bool {
+        let after_match = pos + pattern.len();
+        let prev_is_boundary = pos == 0
+            || !text[..pos]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let next_is_boundary = after_match >= text.len()
+            || !text[after_match..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        prev_is_boundary && next_is_boundary
+    }
+
     /// Check for rate limit / usage limit patterns in text.
     pub fn detect_rate_limit(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -1111,6 +1129,20 @@ pub(crate) mod patterns {
                     .next()
                     .is_some_and(|c| c.is_ascii_digit())
             }));
+
+        // Guard: skip "rate_limit"/"ratelimit" unless at a word boundary — prevents
+        // false positives from test identifiers like `record_rate_limit_returns_id`.
+        // Other patterns (natural-language phrases) are low risk.
+        if let Some(text_pos) = match_pos {
+            for pat in ["rate_limit", "ratelimit"] {
+                if text[text_pos..].to_lowercase().starts_with(pat)
+                    && !is_word_boundary(text, text_pos, pat)
+                {
+                    return None;
+                }
+            }
+        }
+
         if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
@@ -1765,6 +1797,59 @@ mod tests {
              To ensure system stability, please adjust your client logic to scale requests more smoothly over time."
         ).is_some());
         assert!(patterns::detect_rate_limit("all good").is_none());
+    }
+
+    /// Regression test: the nextest line from #3274 must NOT trigger rate limit
+    /// detection — `record_rate_limit_returns_id` is a test identifier, not an error.
+    #[test]
+    fn detect_rate_limit_word_boundary_suppresses_test_identifier() {
+        let line =
+            "PASS [ 0.229s] (3552/3639) orch::store::tests::record_rate_limit_returns_id";
+        assert!(
+            patterns::detect_rate_limit(line).is_none(),
+            "test identifier 'record_rate_limit_returns_id' must not trigger detection"
+        );
+    }
+
+    /// Bare `rate_limit` token in an error context SHOULD still be detected.
+    #[test]
+    fn detect_rate_limit_word_boundary_allows_bare_error_token() {
+        assert!(
+            patterns::detect_rate_limit("error: rate_limit hit on upstream").is_some(),
+            "bare 'rate_limit' in error context must be detected"
+        );
+    }
+
+    /// Compound identifiers (surrounded by alphanumerics/underscores) must NOT match.
+    #[test]
+    fn detect_rate_limit_word_boundary_rejects_compound_identifiers() {
+        assert!(
+            patterns::detect_rate_limit("my_rate_limit_var").is_none(),
+            "compound identifier 'my_rate_limit_var' must not match"
+        );
+        assert!(
+            patterns::detect_rate_limit("rate_limitX").is_none(),
+            "suffixed identifier 'rate_limitX' must not match"
+        );
+        assert!(
+            patterns::detect_rate_limit("Xrate_limit").is_none(),
+            "prefixed identifier 'Xrate_limit' must not match"
+        );
+    }
+
+    /// Unicode edge case: multi-byte char before match must not break boundary check.
+    #[test]
+    fn detect_rate_limit_word_boundary_unicode_safe() {
+        // 'İ' (2-byte) lowercases to 'i̇' (3-byte). Byte offsets differ — the guard
+        // must use text coordinates, not lower coordinates.
+        assert!(
+            patterns::detect_rate_limit("İ rate_limit exceeded").is_some(),
+            "rate_limit after multi-byte char must still be detected"
+        );
+        assert!(
+            patterns::detect_rate_limit("error: rate_limit at pos 3").is_some(),
+            "bare rate_limit at start must be detected"
+        );
     }
 
     #[test]
